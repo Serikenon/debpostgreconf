@@ -1,0 +1,2 @@
+[ansible]
+host1 ansible_host=<IP-address> ansible_user=<ansible_user> ansible_password=<ansible_pass>

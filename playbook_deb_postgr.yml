@@ -1,0 +1,300 @@
+- name: Debian configuration
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Downloading the necessary utilities and packs
+      apt:
+        name:
+          - vim
+          - nano
+          - htop
+          - iftop
+          - mc
+          - curl
+          - fail2ban
+          - gnupg2
+          - iptables  
+        state: present
+
+    - name: Adding repository PostgreSQL 
+      shell: |
+        echo 'deb https://apt.postgresql.org/pub/repos/apt bullseye-pgdg main' > /etc/apt/sources.list.d/pgdg.list
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+
+    - name: Downloading PostgreSQL-16
+      apt:
+        update_cache: yes
+        name:
+          - postgresql-16
+          - postgresql-contrib
+
+    - name: Creating a default user-admin
+      user:
+        name: "{{ ADMIN_NAME }}"
+        password: "{{ '{{ ADMIN_PASS }}' | password_hash('sha512') }}"
+        state: present
+        shell: /bin/bash
+
+    - name: Adding default user-admin to sudoers
+      lineinfile:
+        path: /etc/sudoers
+        line: "{{ ADMIN_NAME }} ALL=(ALL:ALL) ALL"
+        validate: '/usr/sbin/visudo -cf %s'
+
+- name: Firewall rules
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: Allow loopback traffic
+      iptables:
+        chain: INPUT
+        destination: '127.0.0.1'
+        jump: ACCEPT
+
+    - iptables:
+        chain: OUTPUT
+        source: '127.0.0.1'
+        jump: ACCEPT
+
+    - name: Allow traffic from {{ INTERFACE }} interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ INTERFACE }}"
+        jump: ACCEPT
+
+    - iptables:
+        chain: OUTPUT
+        out_interface: "{{ INTERFACE }}"
+        jump: ACCEPT
+
+    - name: Allow ICMP reply and unreachable messages
+      iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: echo-reply
+        jump: ACCEPT
+        state: present
+    - iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: destination-unreachable
+        jump: ACCEPT
+    - iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: time-exceeded
+        jump: ACCEPT
+    - iptables:
+        chain: INPUT
+        protocol: icmp
+        icmp_type: echo-request
+        jump: ACCEPT
+
+    - name: Allow outgoing traffic on {{ INTERFACE }} interface
+      iptables:
+        chain: OUTPUT
+        out_interface: "{{ INTERFACE }}"
+        jump: ACCEPT
+
+    - name: Accept established and related traffic
+      iptables:
+        chain: INPUT
+        match: state
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+      iptables:
+        chain: OUTPUT
+        match: state
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+      iptables:
+        chain: FORWARD
+        match: state
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+
+    - name: Drop invalid packets
+      iptables:
+        chain: INPUT
+        match: state
+        ctstate: INVALID
+        jump: DROP
+      iptables:
+        chain: FORWARD
+        match: state
+        ctstate: INVALID
+        jump: DROP
+
+
+    - name: Drop TCP packets without SYN flag and NEW state(protection against syn-flood attacks)
+      command: iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
+
+    - command: iptables -A OUTPUT -p tcp ! --syn -m state --state NEW -j DROP
+     
+    - name: Allow incoming traffic on port {{ SSH_PORT }} from {{ INTERFACE }} interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ INTERFACE }}"
+        destination_port: "{{ SSH_PORT }}"
+        protocol: tcp
+        jump: ACCEPT
+
+    - name: Allow incoming DNS queries on UDP port 53 from {{ INTERFACE }} interface
+      iptables:
+        chain: INPUT
+        in_interface: "{{ INTERFACE }}"
+        destination_port: 53
+        protocol: udp
+        jump: ACCEPT
+
+    - name: Allow incoming PostgreSQL traffic on TCP port {{ POSTGR_PORT }}
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ POSTGR_PORT }}"
+        jump: ACCEPT
+
+    - iptables:
+        chain: OUTPUT
+        protocol: tcp
+        source_port: "{{ POSTGR_PORT }}"
+        destination_port: "{{ POSTGR_PORT }}"
+        jump: ACCEPT
+
+    - name: Setting a ban on traffic not described by the rules
+      iptables:
+        policy: DROP
+        chain: INPUT
+        state: present
+
+    - iptables:
+        policy: DROP
+        chain: OUTPUT
+        state: present
+
+    - iptables:
+        policy: DROP
+        chain: FORWARD
+        state: present
+
+    - name: Prohibit using the server as a network bridge
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 0
+        reload: yes
+
+    - name: Save iptables rules
+      shell: iptables-save > /etc/iptables.rules
+
+
+- name: SSH
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: SSH configuration
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?Port*', line: "Port {{ SSH_PORT }}" }
+        - { regexp: '^#?PasswordAuthentication*', line: "PasswordAuthentication no" }
+        - { regexp: '^#?PermitEmptyPasswords*', line: "PermitEmptyPasswords no" }
+        - { regexp: '^#?PermitRootLogin*', line: "PermitRootLogin no" }
+        - { regexp: '^#?PubkeyAuthentication*', line: "PubkeyAuthentication yes" }
+        - { regexp: '^#?AuthorizedKeysFile*', line: "AuthorizedKeysFile etc/.ssh/authorized_keys %h/.ssh/authorized_keys" }
+
+    - name: Adding exception to sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "Match User {{ ANSIBLE_USER }}\nPasswordAuthentication yes"
+        state: present
+
+- name: Fail2Ban
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: Fail2Ban configuration
+      lineinfile:
+        path: /etc/fail2ban/jail.local
+        line: "{{ item }}"
+        create: yes
+      with_items:
+        - "[sshd]"
+        - "backend = systemd"
+        - "enable = true"
+        - "port = {{ SSH_PORT }}"
+        - "filter = sshd"
+        - "maxretry = 3"
+        - "bantime = 3600"
+        - "ignoreip = 127.0.0.1"
+
+    - name: Сreating a backups
+      cron:
+        name: Backup
+        minute: "0"
+        hour: "0"
+        day: "*/2"
+        job: "/usr/bin/rsync -av --delete / /mnt/backup/"
+
+- name: PostgreSQL
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: Starting PostgreSQL
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Editing postgresql.conf
+      lineinfile:
+        path: /etc/postgresql/16/main/postgresql.conf
+        regexp: '^#?listen_addresses\s*='
+        line: "listen_addresses = '*'"
+
+    - name: Editing pg_hba.conf
+      lineinfile:
+        path: /etc/postgresql/16/main/pg_hba.conf
+        line: "host all all 0.0.0.0/0 password"
+
+- name: Services
+  hosts: ansible
+  become: true
+  vars_files:
+  - secrets.yml
+  tasks:
+    - name: Restarting PostgresSQL
+      service:
+        name: postgresql
+        state: restarted
+
+    - name: Restarting SSH-service
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Starting Fail2Ban-service
+      service:
+        name: fail2ban
+        state: started
+
+    - name: Restarting systemd
+      systemd:
+         daemon_reload: yes
+    
